@@ -7,6 +7,8 @@ import deepspeech
 import numpy as np
 import pyaudio
 import wave
+from scipy.signal.filter_design import butter
+from scipy.signal.signaltools import lfilter, lfilter_zi
 import webrtcvad
 from halo import Halo
 from scipy import signal
@@ -22,8 +24,8 @@ class VoiceAudioService:
     CHANNELS = 1
     BLOCKS_PER_SECOND = 50
 
-    def __init__(self, aggressiveness=3, device=None, input_rate=None, file=None):
-        def proxy_callback(in_data, frame_count, time_info, status):
+    def __init__(self, aggressiveness=2, device=None, input_rate=None, file=None):
+        def callback(in_data, frame_count, time_info, status):
             if self.chunk is not None:
                 in_data = self.wf.readframes(self.chunk)
             self.buffer_queue.put(in_data)
@@ -44,7 +46,7 @@ class VoiceAudioService:
             'rate': self.input_rate,
             'input': True,
             'frames_per_buffer': self.block_size_input,
-            'stream_callback': proxy_callback,
+            'stream_callback': callback,
         }
 
         self.chunk = None
@@ -74,9 +76,25 @@ class VoiceAudioService:
         resample16 = np.array(resample, dtype=np.int16)
         return resample16.tostring()
 
+    filter_enabled = True
+    lowpass_frequency = 60
+    highpass_frequency = 6000
+
     def filter(self, data):
-        #data16 = np.frombuffer(data, dtype=np.int16)
-        return data
+        if not self.filter_enabled:
+            return data
+
+        data16 = np.frombuffer(data, dtype=np.int16)
+
+        nyquist_frequency = 0.5 * self.sample_rate
+        b, a = butter(2, [
+            self.lowpass_frequency / nyquist_frequency,
+            self.highpass_frequency / nyquist_frequency
+        ], btype='bandpass')
+
+        filtered, _ = lfilter(b, a, data16, axis=0, zi=lfilter_zi(b, a))
+
+        return np.array(filtered, dtype=np.int16).tobytes()
 
     def read(self):
         """Return a block of audio data, blocking if necessary."""
@@ -98,8 +116,6 @@ class VoiceAudioService:
         wf.setframerate(self.sample_rate)
         wf.writeframes(data)
         wf.close()
-
-    # VAD
 
     def frames(self):
         """Generator that yields all audio frames from microphone."""
@@ -169,14 +185,17 @@ def init_deepspeech(model, scorer):
     return model
 
 
-def transcribe(model, vad_audio, nospinner, savewav):
+def transcribe(model, vas, nospinner, savewav):
+    if savewav:
+        os.makedirs(savewav, exist_ok=True)
+
     spinner = None
     if not nospinner:
         spinner = Halo(spinner='line')
 
     stream_context = model.createStream()
     wav_data = bytearray()
-    for utterance in vad_audio.utterances():
+    for utterance in vas.utterances():
         if utterance is not None:
             if spinner:
                 spinner.start()
@@ -192,7 +211,7 @@ def transcribe(model, vad_audio, nospinner, savewav):
             logging.debug("end utterence")
 
             if savewav:
-                vad_audio.write_wav(os.path.join(savewav, datetime.now().strftime(
+                vas.write_wav(os.path.join(savewav, datetime.now().strftime(
                     "savewav_%Y-%m-%d_%H-%M-%S_%f.wav")), wav_data)
                 wav_data = bytearray()
 
@@ -206,20 +225,17 @@ def main(args):
     model = init_deepspeech(args.model, args.scorer)
 
     # Start audio
-    vad_audio = VoiceAudioService(aggressiveness=args.vad_aggressiveness,
-                                  device=args.device,
-                                  input_rate=args.rate,
-                                  file=args.file)
+    vas = VoiceAudioService(aggressiveness=args.aggressiveness,
+                            device=args.device,
+                            input_rate=args.rate,
+                            file=args.file)
 
     print("Listening (Ctrl-C to exit).")
 
     # Stream from microphone to DeepSpeech using VAD
-    for text in transcribe(model, vad_audio, args.nospinner, args.savewav):
-        print("Recognised: %s" % text)
-
-        if args.keyboard:
-            from pyautogui import typewrite
-            typewrite(text)
+    for text in transcribe(model, vas, args.nospinner, args.savewav):
+        if text:
+            print("Recognised: %s" % text)
 
 
 if __name__ == '__main__':
@@ -229,27 +245,28 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description="Stream from microphone to DeepSpeech using VAD")
 
-    parser.add_argument('-v', '--vad_aggressiveness', type=int, default=2,
-                        help="Set aggressiveness of VAD: an integer between 0 and 3, 0 being the least aggressive about filtering out non-speech, 3 the most aggressive. Default: 2")
+    parser.add_argument('-a', '--aggressiveness', type=int, default=2,
+                        help="Set the voice activity detection aggressiveness: an integer between 0 and 3, with 0 being the least aggressive at filtering out non-speech and 3 the most aggressive. Default: 2.")
+
     parser.add_argument('--nospinner', action='store_true',
                         help="Disable spinner")
+
     parser.add_argument('-w', '--savewav',
                         help="Save .wav files of utterences to given directory")
+
     parser.add_argument('-f', '--file',
                         help="Read from .wav file instead of microphone")
 
     parser.add_argument('-m', '--model', required=True,
                         help="Path to the model (protocol buffer binary file, or entire directory containing all standard-named files for model)")
+
     parser.add_argument('-s', '--scorer',
                         help="Path to the external scorer file.")
+
     parser.add_argument('-d', '--device', type=int, default=None,
                         help="Device input index (Int) as listed by pyaudio.PyAudio.get_device_info_by_index(). If not provided, falls back to PyAudio.get_default_device().")
+
     parser.add_argument('-r', '--rate', type=int, default=DEFAULT_SAMPLE_RATE,
                         help=f"Input device sample rate. Default: {DEFAULT_SAMPLE_RATE}. Your device may require 44100.")
-    parser.add_argument('-k', '--keyboard', action='store_true',
-                        help="Type output through system keyboard")
-    args = parser.parse_args()
-    if args.savewav:
-        os.makedirs(args.savewav, exist_ok=True)
 
-    main(args)
+    main(parser.parse_args())
