@@ -24,12 +24,14 @@ class VoiceAudioService:
     CHANNELS = 1
     BLOCKS_PER_SECOND = 50
 
-    def __init__(self, aggressiveness=2, device=None, input_rate=None, file=None):
+    def __init__(self, aggressiveness=2, device=None, input_rate=None, file=None, filter=True):
         def callback(in_data, frame_count, time_info, status):
             if self.chunk is not None:
                 in_data = self.wf.readframes(self.chunk)
             self.buffer_queue.put(in_data)
             return (None, pyaudio.paContinue)
+
+        self.filter_enabled = filter
 
         self.buffer_queue = queue.Queue()
         self.device = device
@@ -62,13 +64,9 @@ class VoiceAudioService:
 
         self.vad = webrtcvad.Vad(aggressiveness)
 
-    def resample(self, data, input_rate):
+    def resample(self, data):
         """
         Microphone may not support our native processing sampling rate, so resample from input_rate to sample_rate here for webrtcvad and deepspeech.
-
-        Args:
-            data (binary): Input audio stream
-            input_rate (int): Input audio rate to resample from
         """
         data16 = np.frombuffer(data, dtype=np.int16)
         resample_size = int(len(data16) * self.sample_rate / self.input_rate)
@@ -77,8 +75,8 @@ class VoiceAudioService:
         return resample16.tostring()
 
     filter_enabled = True
-    lowpass_frequency = 60
-    highpass_frequency = 6000
+    lowpass_frequency = 75  # 50
+    highpass_frequency = 4000  # 7999
 
     def filter(self, data):
         if not self.filter_enabled:
@@ -87,7 +85,7 @@ class VoiceAudioService:
         data16 = np.frombuffer(data, dtype=np.int16)
 
         nyquist_frequency = 0.5 * self.sample_rate
-        b, a = butter(2, [
+        b, a = butter(1, [
             self.lowpass_frequency / nyquist_frequency,
             self.highpass_frequency / nyquist_frequency
         ], btype='bandpass')
@@ -95,10 +93,6 @@ class VoiceAudioService:
         filtered, _ = lfilter(b, a, data16, axis=0, zi=lfilter_zi(b, a))
 
         return np.array(filtered, dtype=np.int16).tobytes()
-
-    def read(self):
-        """Return a block of audio data, blocking if necessary."""
-        return self.filter(self.buffer_queue.get())
 
     def destroy(self):
         self.stream.stop_stream()
@@ -118,13 +112,13 @@ class VoiceAudioService:
         wf.close()
 
     def frames(self):
-        """Generator that yields all audio frames from microphone."""
+        """Generator that yields all audio frames from microphone, blocking if necessary."""
         if self.input_rate == self.sample_rate:
             while True:
-                yield self.read()
+                yield self.filter(self.buffer_queue.get())
         else:
             while True:
-                yield self.resample(self.read())
+                yield self.filter(self.resample(self.buffer_queue.get()))
 
     def utterances(self, padding_ms=300, ratio=0.75):
         """Generator that yields series of consecutive audio frames comprising each utterence, separated by yielding a single None.
@@ -210,12 +204,15 @@ def transcribe(model, vas, nospinner, savewav):
 
             logging.debug("end utterence")
 
+            text = stream_context.finishStream()
+
             if savewav:
-                vas.write_wav(os.path.join(savewav, datetime.now().strftime(
-                    "savewav_%Y-%m-%d_%H-%M-%S_%f.wav")), wav_data)
+                if text:
+                    vas.write_wav(os.path.join(savewav, datetime.now().strftime(
+                        "savewav_%Y-%m-%d_%H-%M-%S_%f.wav")), wav_data)
                 wav_data = bytearray()
 
-            yield stream_context.finishStream()
+            yield text
 
             stream_context = model.createStream()
 
@@ -228,7 +225,8 @@ def main(args):
     vas = VoiceAudioService(aggressiveness=args.aggressiveness,
                             device=args.device,
                             input_rate=args.rate,
-                            file=args.file)
+                            file=args.file,
+                            filter=args.filter)
 
     print("Listening (Ctrl-C to exit).")
 
@@ -239,9 +237,8 @@ def main(args):
 
 
 if __name__ == '__main__':
-    DEFAULT_SAMPLE_RATE = 16000
-
     import argparse
+
     parser = argparse.ArgumentParser(
         description="Stream from microphone to DeepSpeech using VAD")
 
@@ -250,6 +247,9 @@ if __name__ == '__main__':
 
     parser.add_argument('--nospinner', action='store_true',
                         help="Disable spinner")
+
+    parser.add_argument('-F', '--filter', action='store_true', default=True,
+                        help="Enable the bandpass filter.")
 
     parser.add_argument('-w', '--savewav',
                         help="Save .wav files of utterences to given directory")
@@ -266,7 +266,7 @@ if __name__ == '__main__':
     parser.add_argument('-d', '--device', type=int, default=None,
                         help="Device input index (Int) as listed by pyaudio.PyAudio.get_device_info_by_index(). If not provided, falls back to PyAudio.get_default_device().")
 
-    parser.add_argument('-r', '--rate', type=int, default=DEFAULT_SAMPLE_RATE,
-                        help=f"Input device sample rate. Default: {DEFAULT_SAMPLE_RATE}. Your device may require 44100.")
+    parser.add_argument('-r', '--rate', type=int, default=VoiceAudioService.sample_rate,
+                        help=f"Input device sample rate. Default: {VoiceAudioService.sample_rate}. Your device may require 44100.")
 
     main(parser.parse_args())
