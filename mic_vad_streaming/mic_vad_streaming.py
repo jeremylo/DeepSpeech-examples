@@ -7,10 +7,8 @@ import deepspeech
 import numpy as np
 import pyaudio
 import wave
-from scipy.signal.filter_design import butter
-from scipy.signal.signaltools import lfilter, lfilter_zi
 import webrtcvad
-from halo import Halo
+import halo
 from scipy import signal
 
 logging.basicConfig(level=20)
@@ -50,7 +48,7 @@ class VoiceAudioService:
             'rate': self.input_rate,
             'input': True,
             'frames_per_buffer': self.block_size_input,
-            'stream_callback': callback,
+            'stream_callback': callback
         }
 
         self.chunk = None
@@ -69,9 +67,13 @@ class VoiceAudioService:
         stream.stop_stream()
         stream.close()
 
+    def _destroy(self):
+        self._end_stream(self.stream)
+        self.pa.terminate()
+
     def _resample(self, data):
         """
-        Microphone may not support our native processing sampling rate, so resample from input_rate to sample_rate here for webrtcvad and deepspeech.
+        The user's microphone may not support the native processing sampling rate, so resample from input_rate to sample_rate here for webrtcvad and deepspeech.
         """
         data16 = np.frombuffer(data, dtype=np.int16)
         resample_size = int(len(data16) * self.sample_rate / self.input_rate)
@@ -86,19 +88,16 @@ class VoiceAudioService:
     def _filter(self, data):
         data16 = np.frombuffer(data, dtype=np.int16)
 
-        nyquist_frequency = 0.5 * self.input_rate
-        b, a = butter(1, [
+        nyquist_frequency = 0.5 * self.sample_rate
+        b, a = signal.filter_design.butter(1, [
             self.lowpass_frequency / nyquist_frequency,
             self.highpass_frequency / nyquist_frequency
         ], btype='bandpass')
 
-        filtered, _ = lfilter(b, a, data16, axis=0, zi=lfilter_zi(b, a))
+        filtered, _ = signal.signaltools.lfilter(
+            b, a, data16, axis=0, zi=signal.signaltools.lfilter_zi(b, a))
 
         return np.array(filtered, dtype=np.int16).tobytes()
-
-    def _destroy(self):
-        self._end_stream(self.stream)
-        self.pa.terminate()
 
     frame_duration_ms = property(
         lambda self: 1000 * self.block_size // self.sample_rate)
@@ -124,7 +123,7 @@ class VoiceAudioService:
         else:
             while True:
                 if self.filter_enabled:
-                    yield self._resample(self._filter(self.buffer_queue.get()))
+                    yield self._filter(self._resample(self.buffer_queue.get()))
                 else:
                     yield self._resample(self.buffer_queue.get())
 
@@ -171,75 +170,80 @@ class VoiceAudioService:
             self._destroy()
 
 
-def init_deepspeech(model, scorer):
-    print("Initialising model: %s" % model)
-    logging.info("Initialising model: %s", model)
+class Transcriber:
 
-    if os.path.isdir(model):
-        model = os.path.join(model, 'output_graph.pb')
-        scorer = os.path.join(model, scorer)
+    def __init__(self, args):
+        # Load the DeepSpeech model
+        self.model = self.init_deepspeech(args.model, args.scorer)
 
-    model = deepspeech.Model(model)
-    if scorer:
-        logging.info("Scorer: %s", scorer)
-        model.enableExternalScorer(scorer)
+        # Start audio
+        self.vas = VoiceAudioService(aggressiveness=args.aggressiveness,
+                                     device=args.device,
+                                     input_rate=args.rate,
+                                     file=args.file,
+                                     filter_enabled=args.filter)
 
-    return model
+    def init_deepspeech(self, model_path, scorer_path):
+        print("Initialising model: %s" % model_path)
+        logging.info("Initialising model: %s", scorer_path)
 
+        if os.path.isdir(model_path):
+            model_path = os.path.join(model_path, 'output_graph.pb')
+            scorer_path = os.path.join(model_path, scorer_path)
 
-def transcribe(model, vas, nospinner, savewav):
-    if savewav:
-        os.makedirs(savewav, exist_ok=True)
+        model = deepspeech.Model(model_path)
+        if scorer_path:
+            logging.info("Scorer: %s", scorer_path)
+            model.enableExternalScorer(scorer_path)
 
-    spinner = None
-    if not nospinner:
-        spinner = Halo(spinner='line')
+        return model
 
-    stream_context = model.createStream()
-    wav_data = bytearray()
-    for utterance in vas.utterances():
-        if utterance is not None:
-            if spinner:
-                spinner.start()
+    def transcribe(self, nospinner, savewav):
+        if savewav:
+            os.makedirs(savewav, exist_ok=True)
 
-            logging.debug("start utterance")
-            stream_context.feedAudioContent(np.frombuffer(utterance, np.int16))
-            if savewav:
-                wav_data.extend(utterance)
-        else:
-            if spinner:
-                spinner.stop()
+        spinner = None
+        if not nospinner:
+            spinner = halo.Halo(spinner='line')
 
-            logging.debug("end utterence")
+        stream_context = self.model.createStream()
+        wav_data = bytearray()
+        for utterance in self.vas.utterances():
+            if utterance is not None:
+                if spinner:
+                    spinner.start()
 
-            text = stream_context.finishStream()
+                logging.debug("start utterance")
+                stream_context.feedAudioContent(
+                    np.frombuffer(utterance, np.int16))
+                if savewav:
+                    wav_data.extend(utterance)
+            else:
+                if spinner:
+                    spinner.stop()
 
-            if savewav:
+                logging.debug("end utterence")
+
+                text = stream_context.finishStream()
                 if text:
-                    vas._write_wav(os.path.join(savewav, datetime.now().strftime(
-                        "savewav_%Y-%m-%d_%H-%M-%S_%f.wav")), wav_data)
-                wav_data = bytearray()
+                    if savewav:
+                        self.vas._write_wav(os.path.join(savewav, datetime.now().strftime(
+                            "%Y-%m-%d_%H-%M-%S - " + text + ".wav")), wav_data)
 
-            yield text
+                    yield text
 
-            stream_context = model.createStream()
+                if savewav:
+                    wav_data = bytearray()
+
+                stream_context = self.model.createStream()
 
 
 def main(args):
-    # Load the DeepSpeech model
-    model = init_deepspeech(args.model, args.scorer)
-
-    # Start audio
-    vas = VoiceAudioService(aggressiveness=args.aggressiveness,
-                            device=args.device,
-                            input_rate=args.rate,
-                            file=args.file,
-                            filter_enabled=args.filter)
+    transcriber = Transcriber(args)
 
     print("Listening (Ctrl-C to exit).")
-
     # Stream from microphone to DeepSpeech using VAD
-    for text in transcribe(model, vas, args.nospinner, args.savewav):
+    for text in transcriber.transcribe(args.nospinner, args.savewav):
         if text:
             print("Recognised: %s" % text)
 
@@ -254,19 +258,19 @@ if __name__ == '__main__':
                         help="Set the voice activity detection aggressiveness: an integer between 0 and 3, with 0 being the least aggressive at filtering out non-speech and 3 the most aggressive. Default: 2.")
 
     parser.add_argument('--nospinner', action='store_true',
-                        help="Disable spinner")
+                        help="Disable spinner.")
 
     parser.add_argument('-F', '--filter', action='store_true',
                         help="Enable the bandpass filter.")
 
     parser.add_argument('-w', '--savewav',
-                        help="Save .wav files of utterences to given directory")
+                        help="Save .wav files of utterences to a given directory.")
 
     parser.add_argument('-f', '--file',
-                        help="Read from .wav file instead of microphone")
+                        help="Read from a .wav file instead of the microphone.")
 
     parser.add_argument('-m', '--model', required=True,
-                        help="Path to the model (protocol buffer binary file, or entire directory containing all standard-named files for model)")
+                        help="Path to the model (protocol buffer binary file, or entire directory containing all standard-named files for model).")
 
     parser.add_argument('-s', '--scorer',
                         help="Path to the external scorer file.")
