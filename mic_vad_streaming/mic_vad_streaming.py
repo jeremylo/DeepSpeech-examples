@@ -18,33 +18,35 @@ logging.basicConfig(level=20)
 
 class VoiceAudioService:
 
-    FORMAT = pyaudio.paInt16
-    # Network/VAD rate-space
-    sample_rate = 16000
-    CHANNELS = 1
-    BLOCKS_PER_SECOND = 50
+    format = pyaudio.paInt16
 
-    def __init__(self, aggressiveness=2, device=None, input_rate=None, file=None, filter=True):
+    # Network/VAD rate-space
+    channels = 1
+    sample_rate = 16000
+    blocks_per_second = 50
+
+    block_size = sample_rate // blocks_per_second
+
+    def __init__(self, aggressiveness=2, device=None, input_rate=None, file=None, filter_enabled=False):
+        self.filter_enabled = filter_enabled
+        self.buffer_queue = queue.Queue()
+        self.device = device
+        self.input_rate = input_rate
+        self.block_size_input = self.input_rate // self.blocks_per_second
+        self.pa = pyaudio.PyAudio()
+        self.stream = self._create_stream(file)
+        self.vad = webrtcvad.Vad(aggressiveness)
+
+    def _create_stream(self, file):
         def callback(in_data, frame_count, time_info, status):
             if self.chunk is not None:
                 in_data = self.wf.readframes(self.chunk)
             self.buffer_queue.put(in_data)
             return (None, pyaudio.paContinue)
 
-        self.filter_enabled = filter
-
-        self.buffer_queue = queue.Queue()
-        self.device = device
-        self.input_rate = input_rate
-        self.block_size = int(self.sample_rate /
-                              float(self.BLOCKS_PER_SECOND))
-        self.block_size_input = int(
-            self.input_rate / float(self.BLOCKS_PER_SECOND))
-        self.pa = pyaudio.PyAudio()
-
         kwargs = {
-            'format': self.FORMAT,
-            'channels': self.CHANNELS,
+            'format': self.format,
+            'channels': self.channels,
             'rate': self.input_rate,
             'input': True,
             'frames_per_buffer': self.block_size_input,
@@ -52,19 +54,22 @@ class VoiceAudioService:
         }
 
         self.chunk = None
-        # if not default device
-        if self.device:
+        if self.device:  # non-default device selected
             kwargs['input_device_index'] = self.device
         elif file is not None:
             self.chunk = 320
             self.wf = wave.open(file, 'rb')
 
-        self.stream = self.pa.open(**kwargs)
-        self.stream.start_stream()
+        stream = self.pa.open(**kwargs)
+        stream.start_stream()
 
-        self.vad = webrtcvad.Vad(aggressiveness)
+        return stream
 
-    def resample(self, data):
+    def _end_stream(self, stream):
+        stream.stop_stream()
+        stream.close()
+
+    def _resample(self, data):
         """
         Microphone may not support our native processing sampling rate, so resample from input_rate to sample_rate here for webrtcvad and deepspeech.
         """
@@ -72,19 +77,16 @@ class VoiceAudioService:
         resample_size = int(len(data16) * self.sample_rate / self.input_rate)
         resample = signal.resample(data16, resample_size)
         resample16 = np.array(resample, dtype=np.int16)
-        return resample16.tostring()
+        return resample16.tobytes()
 
-    filter_enabled = True
-    lowpass_frequency = 75  # 50
-    highpass_frequency = 4000  # 7999
+    filter_enabled = False
+    lowpass_frequency = 75  # 75  # 100  # 75  # 50
+    highpass_frequency = 6000  # 6000  # 7000  # 7999
 
-    def filter(self, data):
-        if not self.filter_enabled:
-            return data
-
+    def _filter(self, data):
         data16 = np.frombuffer(data, dtype=np.int16)
 
-        nyquist_frequency = 0.5 * self.sample_rate
+        nyquist_frequency = 0.5 * self.input_rate
         b, a = butter(1, [
             self.lowpass_frequency / nyquist_frequency,
             self.highpass_frequency / nyquist_frequency
@@ -94,31 +96,37 @@ class VoiceAudioService:
 
         return np.array(filtered, dtype=np.int16).tobytes()
 
-    def destroy(self):
-        self.stream.stop_stream()
-        self.stream.close()
+    def _destroy(self):
+        self._end_stream(self.stream)
         self.pa.terminate()
 
     frame_duration_ms = property(
         lambda self: 1000 * self.block_size // self.sample_rate)
 
-    def write_wav(self, filename, data):
+    def _write_wav(self, filename, data):
         logging.info("write wav %s", filename)
         wf = wave.open(filename, 'wb')
-        wf.setnchannels(self.CHANNELS)
-        wf.setsampwidth(2)  # wf.setsampwidth(self.pa.get_sample_size(FORMAT))
+        wf.setnchannels(self.channels)
+        wf.setsampwidth(2)  # wf.setsampwidth(self.pa.get_sample_size(format))
         wf.setframerate(self.sample_rate)
         wf.writeframes(data)
         wf.close()
 
-    def frames(self):
+    def _frames(self):
         """Generator that yields all audio frames from microphone, blocking if necessary."""
         if self.input_rate == self.sample_rate:
-            while True:
-                yield self.filter(self.buffer_queue.get())
+            if self.filter_enabled:
+                while True:
+                    yield self._filter(self.buffer_queue.get())
+            else:
+                while True:
+                    yield self.buffer_queue.get()
         else:
             while True:
-                yield self.filter(self.resample(self.buffer_queue.get()))
+                if self.filter_enabled:
+                    yield self._resample(self._filter(self.buffer_queue.get()))
+                else:
+                    yield self._resample(self.buffer_queue.get())
 
     def utterances(self, padding_ms=300, ratio=0.75):
         """Generator that yields series of consecutive audio frames comprising each utterence, separated by yielding a single None.
@@ -132,13 +140,22 @@ class VoiceAudioService:
         triggered = False
 
         try:
-            for frame in self.frames():
+            for frame in self._frames():
                 if len(frame) < 640:
                     return
 
                 is_speech = self.vad.is_speech(frame, self.sample_rate)
 
-                if not triggered:
+                if triggered:
+                    yield frame
+                    ring_buffer.append((frame, is_speech))
+                    num_unvoiced = len(
+                        [f for f, speech in ring_buffer if not speech])
+                    if num_unvoiced > ratio * ring_buffer.maxlen:
+                        triggered = False
+                        yield None
+                        ring_buffer.clear()
+                else:
                     ring_buffer.append((frame, is_speech))
                     num_voiced = len(
                         [f for f, speech in ring_buffer if speech])
@@ -148,19 +165,10 @@ class VoiceAudioService:
                             yield f
                         ring_buffer.clear()
 
-                else:
-                    yield frame
-                    ring_buffer.append((frame, is_speech))
-                    num_unvoiced = len(
-                        [f for f, speech in ring_buffer if not speech])
-                    if num_unvoiced > ratio * ring_buffer.maxlen:
-                        triggered = False
-                        yield None
-                        ring_buffer.clear()
         except KeyboardInterrupt:
             pass
         finally:
-            self.destroy()
+            self._destroy()
 
 
 def init_deepspeech(model, scorer):
@@ -208,7 +216,7 @@ def transcribe(model, vas, nospinner, savewav):
 
             if savewav:
                 if text:
-                    vas.write_wav(os.path.join(savewav, datetime.now().strftime(
+                    vas._write_wav(os.path.join(savewav, datetime.now().strftime(
                         "savewav_%Y-%m-%d_%H-%M-%S_%f.wav")), wav_data)
                 wav_data = bytearray()
 
@@ -226,7 +234,7 @@ def main(args):
                             device=args.device,
                             input_rate=args.rate,
                             file=args.file,
-                            filter=args.filter)
+                            filter_enabled=args.filter)
 
     print("Listening (Ctrl-C to exit).")
 
@@ -248,7 +256,7 @@ if __name__ == '__main__':
     parser.add_argument('--nospinner', action='store_true',
                         help="Disable spinner")
 
-    parser.add_argument('-F', '--filter', action='store_true', default=True,
+    parser.add_argument('-F', '--filter', action='store_true',
                         help="Enable the bandpass filter.")
 
     parser.add_argument('-w', '--savewav',
